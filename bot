@@ -1,0 +1,520 @@
+// ===================================
+// КОНСТАНТЫ И НАСТРОЙКИ
+// ===================================
+
+const TOKEN     = "8511091864:AAFohd5-zHav68ZEvZNF0nVucUmTRD9Gzbs"; 
+const CHAT_ID   = "-1003440477465";                 // основной чат
+const SHEET_NAME = "Лист1";
+
+const TARGET_STATUS          = "Воронка / Оплата получена";   // оплата получена
+const TARGET_STATUS_INVOICE  = "Счета на заказ";              // новый статус
+
+// ID тем в группе
+const TOPIC_PAYMENT_RECEIVED  = 195;  // «Объекты в работу (оплата получена)»
+const TOPIC_INVOICE_FOR_ORDER = 173;  // «Счета на заказ»
+const TOPIC_PAID_INVOICES     = 207;  // «Счета на оплату»
+
+// Сопоставление колонок
+const COL_INDEX = {
+  DEAL_ID: 0, STATUS: 2, MANAGER: 10, BRAND: 5,
+  CLIENT_NAME: 34, CLIENT_PHONE: 35, CLIENT_ADDRESS: 36,
+  DOOR_MANUFACTURER: 37, DISCOUNT: 38, INSTALL_COST: 39, DELIVERY_COST: 40,
+  PREPAY_SUM: 23, PREPAY_DATE: 16, FULL_KP_SUM: 21, ADDITIONAL_SALES: 25
+};
+
+// ===================================
+// Вспомогательные функции
+// ===================================
+
+function getCellValue(d, i) {
+  return d && i < d.length && d[i] !== null && d[i] !== undefined
+    ? String(d[i]).trim()
+    : "";
+}
+
+function formatMoney(a) {
+  let n = Number(String(a).replace(/\s/g,'').replace(',','.'));
+  return isNaN(n)
+    ? "0"
+    : Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
+
+function formatDate(d) {
+  if (!d) return "не указана";
+  try {
+    const date = new Date(d);
+    return isNaN(date)
+      ? String(d)
+      : `${date.getDate().toString().padStart(2,'0')}.${(date.getMonth()+1).toString().padStart(2,'0')}.${date.getFullYear()}`;
+  } catch {
+    return String(d);
+  }
+}
+
+// ===================================
+// Отправка в нужную тему
+// ===================================
+
+function sendToTopic(text, topicId, keyboard = null) {
+  const payload = {
+    chat_id: CHAT_ID,
+    message_thread_id: topicId,
+    text: text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true
+  };
+  if (keyboard) payload.reply_markup = JSON.stringify(keyboard);
+
+  UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/sendMessage", {
+    method: "post",
+    payload: payload,
+    muteHttpExceptions: true
+  });
+}
+
+// ===================================
+// Кэш статусов и message_id
+// ===================================
+
+function getPrev(dealId, suffix = "") {
+  const c = PropertiesService.getScriptProperties().getProperty("cache" + suffix);
+  return c ? JSON.parse(c)[dealId] || "" : "";
+}
+
+function savePrev(dealId, status, suffix = "") {
+  let c = PropertiesService.getScriptProperties().getProperty("cache" + suffix) || "{}";
+  c = JSON.parse(c);
+  c[dealId] = status;
+  PropertiesService.getScriptProperties().setProperty("cache" + suffix, JSON.stringify(c));
+}
+
+// Кэш message_id сообщений в теме "Счета на заказ"
+function getInvoiceMessageId(dealId) {
+  const cache = PropertiesService.getScriptProperties().getProperty("invoiceMessageCache");
+  return cache ? JSON.parse(cache)[dealId] || null : null;
+}
+
+function saveInvoiceMessageId(dealId, messageId) {
+  let cache = PropertiesService.getScriptProperties().getProperty("invoiceMessageCache") || "{}";
+  cache = JSON.parse(cache);
+  cache[dealId] = messageId;
+  PropertiesService.getScriptProperties().setProperty("invoiceMessageCache", JSON.stringify(cache));
+}
+
+// Кэш message_id карточек в теме 207
+function getPaidMessageId(dealId) {
+  const cache = PropertiesService.getScriptProperties().getProperty("paidMessageCache");
+  return cache ? JSON.parse(cache)[dealId] || null : null;
+}
+
+function savePaidMessageId(dealId, messageId) {
+  let cache = PropertiesService.getScriptProperties().getProperty("paidMessageCache") || "{}";
+  cache = JSON.parse(cache);
+  cache[dealId] = messageId;
+  PropertiesService.getScriptProperties().setProperty("paidMessageCache", JSON.stringify(cache));
+}
+
+// ===================================
+// 1. Оплата получена → в тему 195
+// ===================================
+
+function createBuhMessage(data, dealId) {
+  const brand        = getCellValue(data, COL_INDEX.BRAND);
+  const manufacturer = getCellValue(data, COL_INDEX.DOOR_MANUFACTURER);
+  const client       = getCellValue(data, COL_INDEX.CLIENT_NAME);
+  const phone        = getCellValue(data, COL_INDEX.CLIENT_PHONE);
+  const address      = getCellValue(data, COL_INDEX.CLIENT_ADDRESS);
+  const discount     = getCellValue(data, COL_INDEX.DISCOUNT);
+  const install      = formatMoney(data[COL_INDEX.INSTALL_COST] || 0);
+  const delivery     = formatMoney(data[COL_INDEX.DELIVERY_COST] || 0);
+  const total        = formatMoney((Number(data[COL_INDEX.FULL_KP_SUM] || 0) + Number(data[COL_INDEX.ADDITIONAL_SALES] || 0)));
+  const paid         = formatMoney(data[COL_INDEX.PREPAY_SUM] || 0);
+  const paidDate     = formatDate(data[COL_INDEX.PREPAY_DATE]);
+
+  let msg = `<b>НОВАЯ ОПЛАЧЕННАЯ СДЕЛКА</b>\n\n`;
+  msg += `ID: <code>${dealId}</code>\n`;
+  msg += `Бренд: ${brand || "-"}\n`;
+  msg += `Заказчик: ${client || "-"}\n`;
+  msg += `Телефон: ${phone || "-"}\n`;
+  msg += `Адрес: ${address || "-"}\n`;
+  msg += `${manufacturer || "-"}\n`;
+  if (discount) msg += `Скидка: ${discount}\n`;
+  msg += `Сметная стоимость: ${total}\n`;
+  msg += `Оплачено: ${paid}`;
+  if (paidDate !== "не указана") msg += ` (перевод на Сбер от ${paidDate})`;
+  msg += `\nМонтаж: ${install}\n`;
+  msg += `Доставка: ${delivery}`;
+  return msg;
+}
+
+// ===================================
+// 2. Счета на заказ → тема 173 + кнопки
+// ===================================
+
+function createInvoiceMessage(data, dealId) {
+  const manager      = getCellValue(data, COL_INDEX.MANAGER) || "не указан";
+  const brand        = getCellValue(data, COL_INDEX.BRAND) || "-";
+  const manufacturer = getCellValue(data, COL_INDEX.DOOR_MANUFACTURER) || "-";
+  const total        = formatMoney((Number(data[COL_INDEX.FULL_KP_SUM] || 0) + Number(data[COL_INDEX.ADDITIONAL_SALES] || 0)));
+  const filesLink    = `https://477658f.amocrm.ru/leads/detail/${dealId}?tab_id=files`;
+
+  const msg = `<b>Новый счёт на заказ!</b>\n\n` +
+              `ID: <code>${dealId}</code>\n` +
+              `Менеджер: ${manager}\n` +
+              `Бренд: ${brand}\n` +
+              `Производитель: ${manufacturer}\n` +
+              `Сумма: ${total} ₽\n\n` +
+              `<a href="${filesLink}">Открыть файлы в сделке</a>\n\n` +
+              `Руководитель производства, согласовать?`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: "Согласовать заказ",    callback_data: `approve_${dealId}` }],
+      [{ text: "Отказать (с причиной)", callback_data: `reject_${dealId}` }]
+    ]
+  };
+
+  return { text: msg, keyboard: keyboard };
+}
+
+// Карточка, создаваемая в теме 207 после согласования
+function createPaidInvoiceCard(data, dealId) {
+  const manager      = getCellValue(data, COL_INDEX.MANAGER) || "не указан";
+  const client       = getCellValue(data, COL_INDEX.CLIENT_NAME) || "-";
+  const phone        = getCellValue(data, COL_INDEX.CLIENT_PHONE) || "-";
+  const address      = getCellValue(data, COL_INDEX.CLIENT_ADDRESS) || "-";
+  const manufacturer = getCellValue(data, COL_INDEX.DOOR_MANUFACTURER) || "-";
+  const total        = formatMoney((Number(data[COL_INDEX.FULL_KP_SUM] || 0) + Number(data[COL_INDEX.ADDITIONAL_SALES] || 0)));
+  const filesLink    = `https://477658f.amocrm.ru/leads/detail/${dealId}?tab_id=files`;
+
+  return `<b>СЧЁТ НА ОПЛАТУ — ЗАКАЗ СОГЛАСОВАН</b>\n\n` +
+         `ID: <code>${dealId}</code>\n` +
+         `Менеджер: ${manager}\n` +
+         `Заказчик: ${client}\n` +
+         `Телефон: ${phone}\n` +
+         `Адрес: ${address}\n` +
+         `Производитель: ${manufacturer}\n` +
+         `Сумма: ${total} ₽\n\n` +
+         `<a href="${filesLink}">ОТКРЫТЬ ФАЙЛЫ В СДЕЛКЕ</a>\n\n` +
+         `<b>НОМЕРА СЧЁТОВ ОТ ФАБРИК</b>\нпока ничего не вписано\n\n` +
+         `<i>Ответьте на это сообщение — я соберу все номера счетов сюда автоматически</i>`;
+}
+
+// ===================================
+// Основной триггер по изменению таблицы
+// ===================================
+
+function installedOnEdit(e) {
+  if (!e || e.changeType !== "EDIT") return;
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const ranges = e.source.getActiveRangeList()?.getRanges() || [];
+  if (ranges.length === 0) return;
+
+  const rows = new Set();
+  ranges.forEach(r => {
+    for (let i = r.getRow(); i <= r.getLastRow(); i++) {
+      if (i >= 2) rows.add(i);
+    }
+  });
+
+  rows.forEach(rowNum => {
+    const data   = sheet.getRange(rowNum, 1, 1, 50).getValues()[0];
+    const dealId = getCellValue(data, COL_INDEX.DEAL_ID);
+    if (!dealId) return;
+
+    const status = getCellValue(data, COL_INDEX.STATUS);
+
+    // 1. Оплата получена
+    if (status === TARGET_STATUS && getPrev(dealId) !== status) {
+      sendToTopic(createBuhMessage(data, dealId), TOPIC_PAYMENT_RECEIVED);
+      savePrev(dealId, status);
+    }
+
+    // 2. Счета на заказ
+    if (status === TARGET_STATUS_INVOICE && getPrev(dealId, "_invoice") !== status) {
+      const msg = createInvoiceMessage(data, dealId);
+
+      const payload = {
+        chat_id: CHAT_ID,
+        message_thread_id: TOPIC_INVOICE_FOR_ORDER,
+        text: msg.text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: JSON.stringify(msg.keyboard)
+      };
+
+      const response = UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/sendMessage", {
+        method: "post",
+        payload: payload,
+        muteHttpExceptions: true
+      });
+
+      const result = JSON.parse(response.getContentText());
+      if (result.ok) {
+        saveInvoiceMessageId(dealId, result.result.message_id);
+      }
+
+      savePrev(dealId, status, "_invoice");
+    }
+  });
+}
+
+// ===================================
+// Настройка триггеров (запустить один раз вручную)
+// ===================================
+
+function setupAll() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger("installedOnEdit")
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onChange()
+    .create();
+}
+
+// ===================================
+// Обработка callback-кнопок
+// ===================================
+
+function handleCallbackQuery(cb) {
+  const dataStr = cb.data || "";
+  if (!dataStr || !dataStr.includes("_")) return;
+
+  const parts  = dataStr.split("_");
+  const action = parts[0];
+  const dealId = parts[1];
+
+  const messageId = getInvoiceMessageId(dealId);
+  if (!messageId) return;
+
+  let editText = "";
+  if (action === "approve") {
+    editText = `СОГЛАСОВАНО ✅\n\nЗаказ по сделке ${dealId} согласован и перенесён в «Счета на оплату»`;
+
+    // Перенос в тему 207
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+    if (sheet) {
+      const allRows = sheet.getDataRange().getValues();
+      let foundRow  = null;
+      for (let row of allRows) {
+        if (String(row[COL_INDEX.DEAL_ID]).trim() === dealId) {
+          foundRow = row;
+          break;
+        }
+      }
+
+      if (foundRow) {
+        const cardText = createPaidInvoiceCard(foundRow, dealId);
+
+        const payload = {
+          chat_id: CHAT_ID,
+          message_thread_id: TOPIC_PAID_INVOICES,
+          text: cardText,
+          parse_mode: "HTML",
+          disable_web_page_preview: true
+        };
+
+        const resp = UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/sendMessage", {
+          method: "post",
+          payload: payload,
+          muteHttpExceptions: true
+        });
+
+        const json = JSON.parse(resp.getContentText());
+        if (json.ok) {
+          savePaidMessageId(dealId, json.result.message_id);
+        }
+      }
+    }
+
+  } else if (action === "reject") {
+    editText = `ОТКАЗАНО ❌\n\nЗаказ по сделке ${dealId} отклонён.\nНапишите причину в ответ на это сообщение.`;
+  }
+
+  // Редактируем исходное сообщение в теме 173
+  UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/editMessageText", {
+    method: "post",
+    payload: JSON.stringify({
+      chat_id: CHAT_ID,
+      message_thread_id: TOPIC_INVOICE_FOR_ORDER,
+      message_id: messageId,
+      text: editText,
+      parse_mode: "HTML"
+    }),
+    contentType: "application/json",
+    muteHttpExceptions: true
+  });
+
+  // Подтверждаем кнопку
+  UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/answerCallbackQuery", {
+    method: "post",
+    payload: JSON.stringify({ callback_query_id: cb.id }),
+    contentType: "application/json",
+    muteHttpExceptions: true
+  });
+}
+
+// ===================================
+// История номеров счетов (кэш)
+// ===================================
+
+function getOrdersHistory(dealId) {
+  const hist = PropertiesService.getScriptProperties().getProperty("orders_" + dealId);
+  if (hist) {
+    try {
+      return JSON.parse(hist);
+    } catch (e) {
+      Logger.log(`❌ Ошибка парсинга истории для сделки ${dealId}: ${e.toString()}`);
+      return [];
+    }
+  }
+  return [];
+}
+
+function addToOrdersHistory(dealId, text) {
+  let history = getOrdersHistory(dealId);
+  const today = new Date().toLocaleDateString('ru-RU');
+  history.push({ date: today, text: text.trim() });
+  PropertiesService.getScriptProperties().setProperty("orders_" + dealId, JSON.stringify(history));
+}
+
+function buildPaidCardText(dealId, baseData) {
+  const history      = getOrdersHistory(dealId);
+  const client       = getCellValue(baseData, COL_INDEX.CLIENT_NAME) || "-";
+  const phone        = getCellValue(baseData, COL_INDEX.CLIENT_PHONE) || "-";
+  const address      = getCellValue(baseData, COL_INDEX.CLIENT_ADDRESS) || "-";
+  const manufacturer = getCellValue(baseData, COL_INDEX.DOOR_MANUFACTURER) || "-";
+  const total        = formatMoney((Number(baseData[COL_INDEX.FULL_KP_SUM] || 0) + Number(baseData[COL_INDEX.ADDITIONAL_SALES] || 0)));
+  const filesLink    = `https://477658f.amocrm.ru/leads/detail/${dealId}?tab_id=files`;
+
+  let ordersText = history.length === 0 ? "пока ничего не вписано" : "";
+
+  history.forEach(entry => {
+    ordersText += `\n<b>${entry.date}</b>\n${entry.text.replace(/\n/g, "\n")}`;
+  });
+
+  return `<b>СЧЁТ НА ОПЛАТУ — ЗАКАЗ СОГЛАСОВАН</b>\n\n` +
+         `ID: <code>${dealId}</code>\n` +
+         `Заказчик: ${client}\n` +
+         `Телефон: ${phone}\n` +
+         `Адрес: ${address}\n` +
+         `Производитель: ${manufacturer}\n` +
+         `Сумма: ${total} ₽\n\n` +
+         `<a href="${filesLink}">ОТКРЫТЬ ФАЙЛЫ В СДЕЛКЕ</a>\n\n` +
+         `<b>НОМЕРА СЧЁТОВ ОТ ФАБРИК</b>\n${ordersText}\n\n` +
+         `<i>Продолжайте отвечать на это сообщение — всё будет добавляться автоматически</i>`;
+}
+
+// ===================================
+// Обработка ответов на карточку в теме 207
+// ===================================
+
+function handleReplyInPaidTopic(update) {
+  try {
+    const replyMsg = update.message;
+    if (!replyMsg || !replyMsg.reply_to_message || !replyMsg.message_thread_id) return false;
+
+    const repliedMsg = replyMsg.reply_to_message;
+    Logger.log(`Сообщение-ответ получено в теме: ${replyMsg.message_thread_id}`);
+
+    // 1. Проверяем тему
+    if (String(replyMsg.message_thread_id) !== String(TOPIC_PAID_INVOICES)) {
+      Logger.log(`❌ Ошибка темы: ${replyMsg.message_thread_id}. Должно быть ${TOPIC_PAID_INVOICES}.`);
+      return false;
+    }
+
+    // 2. Проверяем, что это ответ на нашу карточку
+    const repliedText = (repliedMsg.text || repliedMsg.caption || "");
+    if (!repliedText.includes("СЧЁТ НА ОПЛАТУ")) {
+      Logger.log("❌ Ответ не на карточку 'СЧЁТ НА ОПЛАТУ'.");
+      return false;
+    }
+
+    // 3. Извлекаем ID сделки
+    const match = repliedText.match(/ID:\s*(\d+)/);
+    if (!match) {
+      Logger.log("❌ Не удалось найти ID сделки в тексте карточки.");
+      Logger.log("Текст карточки: " + repliedText);
+      return false;
+    }
+
+    const dealId  = match[1];
+    const userText = replyMsg.text || "";
+    if (!userText.trim()) return true;
+
+    Logger.log(`✅ ID Сделки найден: ${dealId}. Текст для добавления: ${userText}`);
+
+    // 4. Сохраняем в историю
+    addToOrdersHistory(dealId, userText);
+
+    // 5. Ищем строку в таблице
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+    let rowData = null;
+    if (sheet) {
+      const dealIds = sheet.getRange("A2:A" + sheet.getLastRow()).getValues();
+      const rowNum  = dealIds.findIndex(r => String(r[0]).trim() === dealId) + 2;
+      if (rowNum >= 2) {
+        rowData = sheet.getRange(rowNum, 1, 1, 50).getValues()[0];
+      }
+    }
+
+    if (!rowData) {
+      Logger.log(`❌ Данные сделки ${dealId} не найдены в таблице.`);
+      return true;
+    }
+
+    // 6. Редактируем карточку
+    const newText = buildPaidCardText(dealId, rowData);
+    UrlFetchApp.fetch("https://api.telegram.org/bot" + TOKEN + "/editMessageText", {
+      method: "post",
+      payload: JSON.stringify({
+        chat_id: CHAT_ID,
+        message_thread_id: TOPIC_PAID_INVOICES,
+        message_id: repliedMsg.message_id,
+        text: newText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      }),
+      contentType: "application/json",
+      muteHttpExceptions: true
+    });
+
+    Logger.log(`✅ Карточка для сделки ${dealId} успешно обновлена.`);
+    return true;
+
+  } catch (e) {
+    Logger.log("❌ Критическая ошибка в handleReplyInPaidTopic: " + e.toString());
+    return false;
+  }
+}
+
+// ===================================
+// Webhook для Telegram (единый doPost)
+// ===================================
+
+function doPost(e) {
+  if (!e || !e.postData || !e.postData.contents) {
+    return ContentService.textOutput("ok");
+  }
+
+  try {
+    const update = JSON.parse(e.postData.contents);
+    Logger.log("🔔 Получено обновление: " + JSON.stringify(update));
+
+    if (update.callback_query) {
+      Logger.log("✅ Обрабатывается Callback Query.");
+      handleCallbackQuery(update.callback_query);
+    }
+
+    if (update.message) {
+      Logger.log("📧 Обрабатывается входящее сообщение.");
+      handleReplyInPaidTopic(update);
+    }
+
+  } catch (err) {
+    Logger.log("❌ Критическая ошибка в doPost: " + err);
+  }
+
+  return ContentService.textOutput("ok");
+}
